@@ -2,3 +2,5 @@ streamlit
 yfinance
 pandas
 plotly
+scipy
+git+https://github.com/druzsan/justetf-scraping.git

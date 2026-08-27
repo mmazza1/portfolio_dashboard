@@ -1,30 +1,37 @@
 """Resolve DEGIRO positions (by ISIN) to Yahoo Finance ticker, asset type,
 sector, region, and (for ETFs) top holdings.
 
-Sector is always expressed as a `sector_weights` dict mapping a GICS-style
-sector name to a weight (a stock is `{sector: 1.0}`; an ETF is its real
-look-through breakdown). This lets the dashboard sum weighted sector exposure
-the same way regardless of asset type. ETF sector_weightings keys come back
-snake_cased from Yahoo (e.g. "consumer_cyclical") and are remapped to match
-the Title Case strings Yahoo uses for a stock's `sector` field, so the two
-sources join on the same key.
-Region is inherently an approximation: no free API cleanly answers "where
-does this company's business actually happen." A stock's HQ country from
-Yahoo is often just its legal domicile (Netherlands, Ireland, Luxembourg,
-Bermuda, Cayman Islands, Switzerland are common tax/incorporation shells),
-which can be unrelated to where it trades or operates. For those domiciles,
-we fall back to the region of its primary listing exchange instead. Genuine
-edge cases (a resolvable ticker with a still-misleading region, or an ISIN
-Yahoo's search can't find at all) can be corrected by hand in overrides.csv.
+Both sector and region are expressed as a `_weights` dict mapping a bucket
+name to a weight (a stock is `{bucket: 1.0}`; an ETF is its real look-through
+breakdown). This lets the dashboard sum weighted exposure the same way
+regardless of asset type. ETF sector_weightings keys come back snake_cased
+from Yahoo (e.g. "consumer_cyclical") and are remapped to match the Title
+Case strings Yahoo uses for a stock's `sector` field, so the two sources join
+on the same key.
+
+Region is inherently an approximation for stocks: no free API cleanly
+answers "where does this company's business actually happen," and a stock's
+HQ country from Yahoo is often just its legal domicile (Nebius is HQ'd in
+Amsterdam but isn't a Dutch business). This is an accepted limitation, rare
+enough to fix by hand via overrides.csv rather than infer generically. ETFs
+don't have this problem: their real country look-through is scraped from
+justETF (keyed by ISIN, via the unofficial `justetf-scraping` package) since
+Yahoo Finance has no country/region weighting field for funds. Results are
+cached in `fund_regions.csv`, scraped once per ISIN, ever, and reused on
+every later run. A scrape failure is marked `{"Unknown": 1.0}` rather than
+crashing the pipeline, and is not cached, so it's retried on the next run.
 """
 
 import csv
 import os
 
+import justetf_scraping
 import pandas as pd
 import yfinance as yf
 
 _OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "overrides.csv")
+_FUND_REGIONS_PATH = os.path.join(os.path.dirname(__file__), "fund_regions.csv")
+_FUND_REGIONS_FIELDS = ["isin", "country", "percentage"]
 
 ASSET_TYPE_LABELS = {
     "EQUITY": "Stock",
@@ -49,89 +56,6 @@ _SECTOR_KEY_MAP = {
     "healthcare": "Healthcare",
 }
 
-# Ordered most-specific-first: an ETF's proxy region is the first keyword
-# match found in its fund name/category text.
-_REGION_KEYWORDS = [
-    ("Emerging Markets", ["emerging market", "em imi", "msci em"]),
-    ("Japan", ["japan", "topix", "nikkei"]),
-    ("China", ["china", "csi 300", "hang seng"]),
-    ("Europe", ["europe", "stoxx", "eurozone", "euro stoxx"]),
-    ("Asia Pacific", ["asia", "pacific", "asean"]),
-    ("United States", ["s&p 500", "russell", "nasdaq", "united states"]),
-    ("Global", ["all-world", "all world", "acwi", "world"]),
-]
-
-# HQ countries that are common tax/incorporation domiciles rather than a
-# meaningful signal of where a business actually operates.
-_DOMICILE_ONLY_COUNTRIES = {
-    "Netherlands",
-    "Ireland",
-    "Luxembourg",
-    "Bermuda",
-    "Cayman Islands",
-    "Switzerland",
-}
-
-# Yahoo's short exchange code (quote["exchange"] / info["exchange"]) to a
-# region label, used as the domicile-only fallback above.
-_EXCHANGE_REGION_MAP = {
-    "NMS": "United States",
-    "NYQ": "United States",
-    "NGM": "United States",
-    "NCM": "United States",
-    "PCX": "United States",
-    "ASE": "United States",
-    "BTS": "United States",
-    "LSE": "United Kingdom",
-    "GER": "Germany",
-    "FRA": "Germany",
-    "STU": "Germany",
-    "DUS": "Germany",
-    "BER": "Germany",
-    "MUN": "Germany",
-    "HAM": "Germany",
-    "AMS": "Netherlands",
-    "PAR": "France",
-    "MIL": "Italy",
-    "MCE": "Spain",
-    "EBS": "Switzerland",
-    "VTX": "Switzerland",
-    "STO": "Sweden",
-    "CPH": "Denmark",
-    "OSL": "Norway",
-    "HEL": "Finland",
-    "BRU": "Belgium",
-    "LIS": "Portugal",
-    "VIE": "Austria",
-    "ISE": "Ireland",
-    "WSE": "Poland",
-    "ATH": "Greece",
-    "TOR": "Canada",
-    "TSX": "Canada",
-    "TSXV": "Canada",
-    "MEX": "Mexico",
-    "SAO": "Brazil",
-    "ASX": "Australia",
-    "NZE": "New Zealand",
-    "HKG": "Hong Kong",
-    "SHH": "China",
-    "SHZ": "China",
-    "TAI": "Taiwan",
-    "TWO": "Taiwan",
-    "JPX": "Japan",
-    "TYO": "Japan",
-    "KSC": "South Korea",
-    "KOE": "South Korea",
-    "SES": "Singapore",
-    "SGX": "Singapore",
-    "NSI": "India",
-    "BSE": "India",
-    "JNB": "South Africa",
-    "TLV": "Israel",
-    "IST": "Turkey",
-}
-
-
 def _load_overrides() -> dict[str, dict]:
     if not os.path.exists(_OVERRIDES_PATH):
         return {}
@@ -148,6 +72,42 @@ def _load_overrides() -> dict[str, dict]:
 OVERRIDES = _load_overrides()
 
 
+def _load_fund_regions_cache() -> dict[str, dict[str, float]]:
+    if not os.path.exists(_FUND_REGIONS_PATH):
+        return {}
+    cache: dict[str, dict[str, float]] = {}
+    with open(_FUND_REGIONS_PATH, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            cache.setdefault(row["isin"], {})[row["country"]] = float(row["percentage"]) / 100
+    return cache
+
+
+FUND_REGIONS_CACHE = _load_fund_regions_cache()
+
+
+def _append_fund_regions_cache(isin: str, region_weights: dict[str, float]) -> None:
+    file_exists = os.path.exists(_FUND_REGIONS_PATH)
+    with open(_FUND_REGIONS_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_FUND_REGIONS_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        for country, weight in region_weights.items():
+            writer.writerow({"isin": isin, "country": country, "percentage": weight * 100})
+
+
+def _resolve_etf_region_weights(isin: str) -> dict[str, float]:
+    if isin in FUND_REGIONS_CACHE:
+        return FUND_REGIONS_CACHE[isin]
+    try:
+        overview = justetf_scraping.get_etf_overview(isin)
+        region_weights = {c["name"]: c["percentage"] / 100 for c in overview["countries"]}
+    except Exception:
+        return {"Unknown": 1.0}
+    FUND_REGIONS_CACHE[isin] = region_weights
+    _append_fund_regions_cache(isin, region_weights)
+    return region_weights
+
+
 def _resolve_quote(isin: str) -> dict | None:
     query = OVERRIDES.get(isin, {}).get("ticker") or isin
     try:
@@ -157,45 +117,30 @@ def _resolve_quote(isin: str) -> dict | None:
     return quotes[0] if quotes else None
 
 
-def _classify_region_from_text(text: str) -> str:
-    text = (text or "").lower()
-    for region, keywords in _REGION_KEYWORDS:
-        if any(kw in text for kw in keywords):
-            return region
-    return "Unclassified"
-
-
-def _enrich_stock(ticker: str, exchange: str | None) -> dict:
+def _enrich_stock(ticker: str) -> dict:
     info = yf.Ticker(ticker).info
     sector = info.get("sector")
-
     region = info.get("country")
-    if region in _DOMICILE_ONLY_COUNTRIES:
-        region = _EXCHANGE_REGION_MAP.get(exchange, region)
 
     return {
         "sector_weights": {sector: 1.0} if sector else {},
-        "region": region,
+        "region_weights": {region: 1.0} if region else {},
         "top_holdings": [],
     }
 
 
-def _enrich_etf(ticker: str, fallback_name: str) -> dict:
+def _enrich_etf(ticker: str, isin: str) -> dict:
     fund = yf.Ticker(ticker).funds_data
 
     sector_weights = {}
     for key, weight in (fund.sector_weightings or {}).items():
         sector_weights[_SECTOR_KEY_MAP.get(key, key)] = weight
 
-    overview = fund.fund_overview or {}
-    region_text = " ".join(filter(None, [fallback_name, overview.get("categoryName")]))
-    region = _classify_region_from_text(region_text)
-
     top_holdings = list(fund.top_holdings.index) if fund.top_holdings is not None else []
 
     return {
         "sector_weights": sector_weights,
-        "region": region,
+        "region_weights": _resolve_etf_region_weights(isin),
         "top_holdings": top_holdings,
     }
 
@@ -210,7 +155,7 @@ def enrich_isin(isin: str) -> dict:
         "name": None,
         "asset_type": None,
         "sector_weights": {},
-        "region": None,
+        "region_weights": {},
         "top_holdings": [],
         "error": None,
     }
@@ -231,15 +176,15 @@ def enrich_isin(isin: str) -> dict:
 
     try:
         if quote_type == "ETF":
-            result.update(_enrich_etf(ticker, name))
+            result.update(_enrich_etf(ticker, isin))
         else:
-            result.update(_enrich_stock(ticker, quote.get("exchange")))
+            result.update(_enrich_stock(ticker))
     except Exception as exc:
         result["error"] = f"Resolved to {ticker} but enrichment lookup failed: {exc}"
 
     region_override = OVERRIDES.get(isin, {}).get("region")
     if region_override:
-        result["region"] = region_override
+        result["region_weights"] = {region_override: 1.0}
 
     return result
 
@@ -261,7 +206,7 @@ def enrich_positions(positions: pd.DataFrame) -> pd.DataFrame:
                     "name": row.product,
                     "asset_type": "Cash",
                     "sector_weights": {},
-                    "region": None,
+                    "region_weights": {},
                     "top_holdings": [],
                     "error": None,
                 }
@@ -282,12 +227,16 @@ if __name__ == "__main__":
     positions = parse_degiro_csv(r"C:\Users\Matteo\Downloads\Portfolio.csv")
     enriched = enrich_positions(positions)
 
-    cols = ["product", "isin", "enrich_ticker", "enrich_asset_type", "enrich_region", "enrich_error"]
+    cols = ["product", "isin", "enrich_ticker", "enrich_asset_type", "enrich_error"]
     print(enriched[cols].to_string())
     print()
     for row in enriched.itertuples():
         if row.enrich_sector_weights:
             print(f"{row.enrich_ticker}: {row.enrich_sector_weights}")
+    print()
+    for row in enriched.itertuples():
+        if row.enrich_region_weights:
+            print(f"{row.enrich_ticker}: {row.enrich_region_weights}")
     print()
     for row in enriched.itertuples():
         if row.enrich_top_holdings:
