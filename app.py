@@ -171,7 +171,7 @@ def concentration_flags(
 
     for label, breakdown_fn, threshold in (
         ("Sector", sector_breakdown, sector_threshold),
-        ("Region", region_breakdown, region_threshold),
+        ("Region", continent_breakdown, region_threshold),
     ):
         breakdown = breakdown_fn(sector_region_source)
         for _, r in breakdown.iterrows():
@@ -279,12 +279,11 @@ if not etf_only.empty:
     )
 sector_region_source = etf_only if scope == "ETFs only" else non_cash
 scope_suffix = " (ETFs only)" if scope == "ETFs only" else ""
-# ETFs are excluded from the asset-level check in whole-portfolio scope --
-# they're inherently diversified, so a large ETF holding isn't the same kind
-# of risk as a large single-stock position. Scoped to ETFs only, that
-# reasoning flips: the ETFs *are* the whole universe in view, so checking
-# concentration among them is exactly the relevant question.
-position_source = etf_only if scope == "ETFs only" else enriched[enriched["enrich_asset_type"] != "ETF"]
+# ETFs are inherently diversified, so a large ETF holding isn't the same kind
+# of risk as a large single-stock position -- excluded from the asset check
+# in whole-portfolio scope, and skipped entirely (no asset check at all) in
+# ETFs-only scope, which only warns on sector/region concentration.
+position_source = enriched.iloc[0:0] if scope == "ETFs only" else enriched[enriched["enrich_asset_type"] != "ETF"]
 concentration_total_value = etf_only["value_eur"].sum() if scope == "ETFs only" else total_value
 
 lookup_errors = enriched.loc[~enriched["is_cash"] & enriched["enrich_error"].notna(), ["product", "enrich_error"]]
