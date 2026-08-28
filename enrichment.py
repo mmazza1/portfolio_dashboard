@@ -1,5 +1,5 @@
 """Resolve DEGIRO positions (by ISIN) to Yahoo Finance ticker, asset type,
-sector, region, and (for ETFs) top holdings.
+sector, region, and (for ETFs) top holdings and TER.
 
 Both sector and region are expressed as a `_weights` dict mapping a bucket
 name to a weight (a stock is `{bucket: 1.0}`; an ETF is its real look-through
@@ -20,6 +20,13 @@ Yahoo Finance has no country/region weighting field for funds. Results are
 cached in `fund_regions.csv`, scraped once per ISIN, ever, and reused on
 every later run. A scrape failure is marked `{"Unknown": 1.0}` rather than
 crashing the pipeline, and is not cached, so it's retried on the next run.
+
+TER (total expense ratio) comes from the same justETF call, as a plain
+percentage number (0.2 meaning 0.20%, not a 0-1 fraction), cached separately
+in `fund_ter.csv`. The two caches are checked independently rather than
+gated on one flag, so an ISIN whose region was cached before TER tracking
+existed still gets backfilled on the next run instead of permanently
+missing it.
 """
 
 import csv
@@ -32,6 +39,8 @@ import yfinance as yf
 _OVERRIDES_PATH = os.path.join(os.path.dirname(__file__), "overrides.csv")
 _FUND_REGIONS_PATH = os.path.join(os.path.dirname(__file__), "fund_regions.csv")
 _FUND_REGIONS_FIELDS = ["isin", "country", "percentage"]
+_FUND_TER_PATH = os.path.join(os.path.dirname(__file__), "fund_ter.csv")
+_FUND_TER_FIELDS = ["isin", "ter"]
 
 ASSET_TYPE_LABELS = {
     "EQUITY": "Stock",
@@ -95,17 +104,54 @@ def _append_fund_regions_cache(isin: str, region_weights: dict[str, float]) -> N
             writer.writerow({"isin": isin, "country": country, "percentage": weight * 100})
 
 
-def _resolve_etf_region_weights(isin: str) -> dict[str, float]:
-    if isin in FUND_REGIONS_CACHE:
-        return FUND_REGIONS_CACHE[isin]
+def _load_fund_ter_cache() -> dict[str, float]:
+    if not os.path.exists(_FUND_TER_PATH):
+        return {}
+    with open(_FUND_TER_PATH, newline="", encoding="utf-8") as f:
+        return {row["isin"]: float(row["ter"]) for row in csv.DictReader(f) if row["ter"]}
+
+
+FUND_TER_CACHE = _load_fund_ter_cache()
+
+
+def _append_fund_ter_cache(isin: str, ter: float) -> None:
+    file_exists = os.path.exists(_FUND_TER_PATH)
+    with open(_FUND_TER_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_FUND_TER_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({"isin": isin, "ter": ter})
+
+
+def _resolve_etf_overview(isin: str) -> tuple[dict[str, float], float | None]:
+    """Region weights and TER (total expense ratio, as a plain percentage
+    number -- justETF's own `ter` field is e.g. 0.2 meaning 0.20%, not a
+    0-1 fraction) for one ETF, both scraped from justETF in the same call
+    and cached separately in their own CSVs. Cached independently (not "if
+    either is cached, skip") so an ISIN whose region was already cached from
+    before TER was tracked still gets a one-time scrape to backfill TER,
+    rather than silently missing it forever.
+    """
+    region_cached = isin in FUND_REGIONS_CACHE
+    ter_cached = isin in FUND_TER_CACHE
+    if region_cached and ter_cached:
+        return FUND_REGIONS_CACHE[isin], FUND_TER_CACHE[isin]
+
     try:
         overview = justetf_scraping.get_etf_overview(isin)
         region_weights = {c["name"]: c["percentage"] / 100 for c in overview["countries"]}
+        ter = overview.get("ter")
     except Exception:
-        return {"Unknown": 1.0}
-    FUND_REGIONS_CACHE[isin] = region_weights
-    _append_fund_regions_cache(isin, region_weights)
-    return region_weights
+        return FUND_REGIONS_CACHE.get(isin, {"Unknown": 1.0}), FUND_TER_CACHE.get(isin)
+
+    if not region_cached:
+        FUND_REGIONS_CACHE[isin] = region_weights
+        _append_fund_regions_cache(isin, region_weights)
+    if not ter_cached and ter is not None:
+        FUND_TER_CACHE[isin] = ter
+        _append_fund_ter_cache(isin, ter)
+
+    return FUND_REGIONS_CACHE[isin], FUND_TER_CACHE.get(isin)
 
 
 def _resolve_quote(isin: str) -> dict | None:
@@ -137,11 +183,13 @@ def _enrich_etf(ticker: str, isin: str) -> dict:
         sector_weights[_SECTOR_KEY_MAP.get(key, key)] = weight
 
     top_holdings = list(fund.top_holdings.index) if fund.top_holdings is not None else []
+    region_weights, ter = _resolve_etf_overview(isin)
 
     return {
         "sector_weights": sector_weights,
-        "region_weights": _resolve_etf_region_weights(isin),
+        "region_weights": region_weights,
         "top_holdings": top_holdings,
+        "ter": ter,
     }
 
 
@@ -157,6 +205,7 @@ def enrich_isin(isin: str) -> dict:
         "sector_weights": {},
         "region_weights": {},
         "top_holdings": [],
+        "ter": None,
         "error": None,
     }
 
@@ -208,6 +257,7 @@ def enrich_positions(positions: pd.DataFrame) -> pd.DataFrame:
                     "sector_weights": {},
                     "region_weights": {},
                     "top_holdings": [],
+                    "ter": None,
                     "error": None,
                 }
             )
