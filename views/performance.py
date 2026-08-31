@@ -166,10 +166,26 @@ def render_performance_header(
     total_pnl_eur = window_pnl["total_eur"]
     pnl_color = "#1baf7a" if total_pnl_eur >= 0 else "#e34948"
     pnl_sign = "+" if total_pnl_eur >= 0 else ""
+    # % alongside the EUR figure, at Matteo's request -- FIFO P&L over the
+    # window's *starting* holdings value (`baseline`, already computed above
+    # for the chart's own dotted reference line and green/red coloring, so
+    # this reuses it rather than a second, differently-scoped figure).
+    # Deliberately not "gain / cost basis" -- cost basis needs its own FIFO
+    # walk per window and isn't otherwise on hand here, while `baseline` is
+    # already the exact same "where the window started" this P&L figure is
+    # itself measuring change *from*, so the two stay conceptually paired.
+    # Skipped (not shown as a bogus 0% or an error) when the window starts
+    # at 0 -- the "Max" timeframe legitimately does, before the first
+    # purchase existed, and there's no meaningful percentage of nothing.
+    pnl_pct_text = ""
+    if baseline > 0:
+        pnl_pct = total_pnl_eur / baseline * 100
+        pnl_pct_text = f" <span style='color:{pnl_color}'>({pnl_sign}{pnl_pct:.1f}%)</span>"
     pnl_line = (
         f"<div style='margin-top:6px;font-size:0.95rem'>"
         f"<span style='color:{chart_theme['muted']}'>P&amp;L ({timeframe}):</span> "
-        f"<span style='color:{pnl_color};font-weight:600'>{pnl_sign}{format_eur(total_pnl_eur)}</span></div>"
+        f"<span style='color:{pnl_color};font-weight:600'>{pnl_sign}{format_eur(total_pnl_eur)}</span>"
+        f"{pnl_pct_text}</div>"
     )
     st.markdown(pnl_line, unsafe_allow_html=True)
     if window_pnl["unpriced_open_isins"]:
@@ -297,7 +313,7 @@ def render_performance_section(dev_mode: bool, dev_account_path: str) -> pd.Data
     dividends feature -- reverted back to "performance tracking" now that
     Dividends is hidden and that ambiguity doesn't apply, per Matteo.
     """
-    st.sidebar.subheader("Performance tracking")
+    st.sidebar.subheader("Performance tracking (beta)")
     st.sidebar.caption(
         "Optional: upload your DEGIRO Account Statement (Account.csv) to add a value-over-time chart above. "
     )
@@ -328,6 +344,22 @@ def render_performance_section(dev_mode: bool, dev_account_path: str) -> pd.Data
                 if uploaded_account is not None:
                     st.session_state["account_bytes"] = uploaded_account.getvalue()
                     st.session_state["show_upload_panel"] = False
+                    # Keeps dev_data/Account.csv in sync with whatever was
+                    # most recently actually uploaded, same as state.py does
+                    # for Portfolio.csv (`_sync_dev_data` there) -- not
+                    # reused directly from here since state.py already
+                    # imports this module (`from views import performance`),
+                    # so the reverse import would be circular; duplicated
+                    # rather than factored out to a third module for three
+                    # lines. Unlike Portfolio.csv, there's no derived
+                    # on-disk cache to invalidate alongside this one --
+                    # `load_and_reconstruct_value_history` is `@st.
+                    # cache_data`-cached on the file's bytes directly, not a
+                    # separate snapshot file, so a changed dev_account_path
+                    # is automatically a fresh cache key next time regardless.
+                    os.makedirs(os.path.dirname(dev_account_path), exist_ok=True)
+                    with open(dev_account_path, "wb") as f:
+                        f.write(st.session_state["account_bytes"])
                     st.rerun()
             account_bytes = st.session_state.get("account_bytes")
 

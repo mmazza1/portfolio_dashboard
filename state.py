@@ -100,6 +100,21 @@ class DashboardState:
     account_dividends: pd.DataFrame | None
 
 
+def _sync_dev_data(path: str, file_bytes: bytes) -> None:
+    """Writes a just-uploaded file's bytes into dev_data/ too, so DEV_MODE
+    -- a separate on/off switch, not tied to whether an upload happened --
+    always tests against whatever was most recently actually uploaded
+    instead of a fixture that silently drifts out of date. Per Matteo's
+    request: DEV_MODE off doesn't mean dev_data stops being useful, it's
+    used the moment DEV_MODE is flipped back on. `dev_data/` isn't
+    guaranteed to exist yet (a fresh checkout, or `.gitignore`d entirely),
+    so this creates it rather than failing on a missing directory.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(file_bytes)
+
+
 def _save_dev_snapshot(enriched: pd.DataFrame, path: str) -> None:
     snapshot = enriched.copy()
     for col in _DEV_SNAPSHOT_JSON_COLUMNS:
@@ -180,6 +195,15 @@ def load_dashboard_state() -> DashboardState:
             if uploaded_file is not None:
                 st.session_state["portfolio_bytes"] = uploaded_file.getvalue()
                 st.session_state["show_upload_panel"] = False
+                _sync_dev_data(DEV_DATA_PATH, st.session_state["portfolio_bytes"])
+                # The cached snapshot was built from the *previous*
+                # Portfolio.csv -- stale now that dev_data's own copy just
+                # changed underneath it, so it's invalidated here rather
+                # than left to silently serve old classification/prices
+                # against a portfolio that no longer matches, the next time
+                # DEV_MODE is on.
+                if os.path.exists(DEV_SNAPSHOT_PATH):
+                    os.remove(DEV_SNAPSHOT_PATH)
                 st.rerun()
         if st.session_state.get("portfolio_bytes") is None:
             st.info("Upload a DEGIRO Portfolio.csv export to get started.")

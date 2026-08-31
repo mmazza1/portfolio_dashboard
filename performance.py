@@ -122,6 +122,98 @@ def _resolve_currency(ticker: str) -> str | None:
     return _CURRENCY_CACHE[ticker]
 
 
+# (resolved ticker, target currency) -> (matching-listing ticker, its currency),
+# or (None, None) if no match was found. Only ever populated on an actual
+# currency mismatch (see `_find_currency_matching_listing`) -- most ISINs
+# never touch this cache at all.
+_LISTING_MATCH_CACHE: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+
+
+def _dominant_trade_currency(isin_events: pd.DataFrame) -> str | None:
+    """The currency this ISIN's real trades actually executed in, per the
+    broker's own ledger -- majority vote across every priced trade row, in
+    case of a rare mixed history (e.g. a listing migration mid-holding).
+    None if there's no priced trade to go on at all (a position that only
+    ever saw a corporate-action row, never a real buy/sell).
+    """
+    currencies = isin_events["trade_currency"].dropna()
+    if currencies.empty:
+        return None
+    return currencies.mode().iloc[0]
+
+
+def _find_currency_matching_listing(ticker: str, target_currency: str) -> tuple[str | None, str | None]:
+    """A different exchange listing of the *same* security, in
+    `target_currency` -- used when a resolved ticker's own currency doesn't
+    match what the ledger says this ISIN was actually traded in (see the
+    caller). This is the general fix for a real bug found in Matteo's own
+    data (NVIDIA, Vanguard FTSE All-World, iShares Core MSCI EM IMI --
+    confirmed via the ledger's own recorded trade currency: all three were
+    actually traded on their EUR-denominated European listing, not the
+    USD-denominated global one `yf.Search(isin)` resolves to by default).
+    Fixed there with three hand-picked `overrides.csv` entries, which only
+    works for one person's own holdings -- this is a shared, public-facing
+    app, so a fix that needs Matteo to notice and hand-add an override for
+    every other user's own mispriced holding (AAPL, or anything else)
+    doesn't scale. This instead finds it automatically, per ISIN, from data
+    every user's own Account.csv already has (`ledger.py`'s parsed
+    `trade_currency`) -- no override file involved at all.
+
+    Searching the bare ISIN only ever surfaces the one canonical/primary
+    listing (confirmed in real test data -- `yf.Search(isin)` returns
+    exactly one quote, never the regional alternates). Searching by the
+    primary listing's own company name does surface them (also confirmed:
+    searching "NVIDIA Corporation" or "Apple Inc." lists their Frankfurt/
+    XETRA listings alongside the NASDAQ one), so that's the two-step
+    lookup here: resolve the primary ticker's name, then search *that*,
+    keeping the first candidate whose own currency actually matches.
+
+    Deliberately does not touch `overrides.csv` or `enrichment.py`'s own
+    ticker resolution -- that ticker is also what `aggregations.
+    etf_overlap_flags` matches against an ETF's top-holdings list, and
+    those lists always use the primary/global listing's ticker regardless
+    of which listing the ETF itself is queried through (confirmed: VWCE.DE
+    and IE00... both list NVIDIA as 'NVDA', never 'NVD.DE'). Swapping that
+    ticker for a regional one for price accuracy was tried first and broke
+    overlap detection outright (a real regression Matteo caught) -- this
+    function's result is used only inside this module's own price
+    reconstruction, a completely separate ticker resolution from
+    `enrichment.py`'s, so the two purposes can never step on each other
+    again regardless of which listing either one resolves to.
+    """
+    cache_key = (ticker, target_currency)
+    if cache_key in _LISTING_MATCH_CACHE:
+        return _LISTING_MATCH_CACHE[cache_key]
+
+    result: tuple[str | None, str | None] = (None, None)
+    try:
+        info = yf.Ticker(ticker).info
+        name = info.get("longName") or info.get("shortName")
+    except Exception:
+        name = None
+
+    if name:
+        try:
+            candidates = yf.Search(name, max_results=15).quotes
+        except Exception:
+            candidates = []
+        for q in candidates:
+            symbol = q.get("symbol")
+            # Skip the ticker we already have (that's the one whose currency
+            # just failed to match) and anything that isn't a plain
+            # stock/ETF quote -- a same-name option or future could
+            # otherwise match on currency by coincidence.
+            if not symbol or symbol == ticker or q.get("quoteType") not in ("EQUITY", "ETF"):
+                continue
+            candidate_currency = _resolve_currency(symbol)
+            if candidate_currency == target_currency:
+                result = (symbol, candidate_currency)
+                break
+
+    _LISTING_MATCH_CACHE[cache_key] = result
+    return result
+
+
 def _price_series_is_plausible(prices: pd.Series, isin_events: pd.DataFrame) -> bool:
     """True unless a resolved ticker's historical price disagrees with a
     real executed price (from the ledger) by more than `_PRICE_TOLERANCE`x
@@ -302,6 +394,29 @@ def portfolio_value_history(
 
         currency = _resolve_currency(ticker)
 
+        # Every event for this ISIN -- trades, fees, splits -- not
+        # pre-filtered by `price`, so fee rows (which have none, only a
+        # real `cash_amount`) aren't accidentally dropped before they ever
+        # reach the flows loop below. The plausibility check specifically
+        # needs a real per-unit price to compare against, so it filters
+        # its own input rather than filtering `isin_events` itself.
+        isin_events = events[events["isin"] == isin]
+
+        # The resolved ticker can be a genuinely different exchange listing
+        # of the same security than the one this ISIN was actually traded
+        # on -- `yf.Search(isin)` only ever returns the one canonical/global
+        # listing, which won't always be the right one for FX purposes (see
+        # `_find_currency_matching_listing`'s own docstring for how this was
+        # found and why it's handled here, not via `overrides.csv`). The
+        # ledger's own recorded trade currency is the ground truth for what
+        # this ISIN actually settled in; a mismatch against the resolved
+        # ticker's currency is the signal to look for a better listing.
+        real_currency = _dominant_trade_currency(isin_events)
+        if real_currency and currency and real_currency != currency:
+            alt_ticker, alt_currency = _find_currency_matching_listing(ticker, real_currency)
+            if alt_ticker:
+                ticker, currency = alt_ticker, alt_currency
+
         # A few days of slack before the earliest date we actually need --
         # both this ISIN's first event and the caller's own `start` -- since
         # yfinance has no bar on a weekend/holiday and the reindex below
@@ -314,13 +429,6 @@ def portfolio_value_history(
             unresolved.append(isin)
             continue
 
-        # Every event for this ISIN -- trades, fees, splits -- not
-        # pre-filtered by `price`, so fee rows (which have none, only a
-        # real `cash_amount`) aren't accidentally dropped before they ever
-        # reach the flows loop below. The plausibility check specifically
-        # needs a real per-unit price to compare against, so it filters
-        # its own input rather than filtering `isin_events` itself.
-        isin_events = events[events["isin"] == isin]
         if not _price_series_is_plausible(prices, isin_events[isin_events["price"].notna()]):
             unresolved.append(isin)
             # The *historical* series is untrustworthy (that's what just
