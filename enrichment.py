@@ -27,6 +27,18 @@ in `fund_ter.csv`. The two caches are checked independently rather than
 gated on one flag, so an ISIN whose region was cached before TER tracking
 existed still gets backfilled on the next run instead of permanently
 missing it.
+
+Dividend yield is computed from Yahoo's per-payment `.dividends` history
+(trailing 12 months, summed, divided by the current price), not from
+Yahoo's own `dividendYield`/`dividendRate` `.info` fields -- those came
+back `None` for a real distributing ETF (VWRL.AS) in a live test, so
+they're unreliable for ETFs specifically even though they work for stocks.
+Deriving it the same way for both asset types keeps the two sources
+comparable, same rationale as region/sector already being pulled through
+one shared shape. `None` means the lookup itself failed; `0.0` is a
+genuine result (no dividends in the last year -- e.g. an accumulating ETF
+that reinvests internally, or a non-dividend-paying stock), not an error,
+so the two aren't conflated.
 """
 
 import csv
@@ -154,6 +166,30 @@ def _resolve_etf_overview(isin: str) -> tuple[dict[str, float], float | None]:
     return FUND_REGIONS_CACHE[isin], FUND_TER_CACHE.get(isin)
 
 
+def _resolve_dividend_yield(ticker_obj: yf.Ticker) -> float | None:
+    """Trailing-12-month dividend yield (a 0-1 fraction), derived from the
+    per-payment history rather than Yahoo's own dividendYield field (see
+    module docstring). Per-share dividend and price are in the same native
+    currency, so this ratio is currency-agnostic -- the caller can multiply
+    it straight by a position's EUR value without any FX conversion of the
+    dividend amount itself.
+    """
+    try:
+        dividends = ticker_obj.dividends
+        if dividends.empty:
+            return 0.0
+        cutoff = pd.Timestamp.now(tz=dividends.index.tz) - pd.Timedelta(days=365)
+        ttm_dividends = dividends[dividends.index >= cutoff].sum()
+        if ttm_dividends <= 0:
+            return 0.0
+        last_price = ticker_obj.fast_info.last_price
+        if not last_price:
+            return None
+        return ttm_dividends / last_price
+    except Exception:
+        return None
+
+
 def _resolve_quote(isin: str) -> dict | None:
     query = OVERRIDES.get(isin, {}).get("ticker") or isin
     try:
@@ -164,7 +200,8 @@ def _resolve_quote(isin: str) -> dict | None:
 
 
 def _enrich_stock(ticker: str) -> dict:
-    info = yf.Ticker(ticker).info
+    ticker_obj = yf.Ticker(ticker)
+    info = ticker_obj.info
     sector = info.get("sector")
     region = info.get("country")
 
@@ -172,11 +209,13 @@ def _enrich_stock(ticker: str) -> dict:
         "sector_weights": {sector: 1.0} if sector else {},
         "region_weights": {region: 1.0} if region else {},
         "top_holdings": [],
+        "dividend_yield": _resolve_dividend_yield(ticker_obj),
     }
 
 
 def _enrich_etf(ticker: str, isin: str) -> dict:
-    fund = yf.Ticker(ticker).funds_data
+    ticker_obj = yf.Ticker(ticker)
+    fund = ticker_obj.funds_data
 
     sector_weights = {}
     for key, weight in (fund.sector_weightings or {}).items():
@@ -190,6 +229,7 @@ def _enrich_etf(ticker: str, isin: str) -> dict:
         "region_weights": region_weights,
         "top_holdings": top_holdings,
         "ter": ter,
+        "dividend_yield": _resolve_dividend_yield(ticker_obj),
     }
 
 
@@ -206,6 +246,7 @@ def enrich_isin(isin: str) -> dict:
         "region_weights": {},
         "top_holdings": [],
         "ter": None,
+        "dividend_yield": None,
         "error": None,
     }
 
@@ -258,6 +299,7 @@ def enrich_positions(positions: pd.DataFrame) -> pd.DataFrame:
                     "region_weights": {},
                     "top_holdings": [],
                     "ter": None,
+                    "dividend_yield": None,
                     "error": None,
                 }
             )

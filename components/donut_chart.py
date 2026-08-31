@@ -42,32 +42,146 @@ def render_donut(
     ink: str = "#ffffff",
     muted: str = "#c3c2b7",
     height: int = 420,
+    compact: bool = False,
 ) -> None:
-    """Render an interactive donut chart with a holdings list beside it.
+    """Render an interactive donut chart, with a holdings list beside it
+    unless `compact=True`.
 
     `data` is a list of {"label": str, "value": float} pairs, already
     aggregated and ordered by the caller (e.g. one row per sector, per
     position, ...). `view_name` labels the center total when nothing is
     hovered.
 
-    Hovering a slice *or* a list row highlights that one item and keeps it
-    in place -- every other slice fades to a lower opacity rather than the
-    hovered slice pulling outward, and the center text swaps to that item's
-    label/value. There's no small color-dot marker for "this is the
-    selected one"; the distinction is the name text itself (bold, full
-    ink color) against the rest (muted, regular weight). Mouse-out on
-    either side reverts both to their resting state.
+    Hovering a slice highlights it (or, in the non-compact list, hovering
+    a list row does too) and keeps it in place -- every other slice fades
+    to a lower opacity rather than the hovered slice pulling outward, and
+    the center text swaps to that item's label/value. There's no small
+    color-dot marker for "this is the selected one"; the distinction is
+    the name text itself (bold, full ink color) against the rest (muted,
+    regular weight), in the non-compact list. Mouse-out reverts to resting
+    state.
 
-    The list is a visually separate panel (a divider line, its own scroll
-    area) fixed to the same `height` as the donut, so the component's
-    overall size never changes between a 3-row view and a 30-row one --
-    only the list scrolls internally, the donut stays put.
+    `compact=True` (the Overview page's small donut, next to Positions)
+    renders *only* the chart -- no list, no divider line, sized to sit
+    cleanly in a narrower column -- but keeps the same hover-driven
+    center-text swap the full version has; a chart with no adjacent list
+    to sync hover state with doesn't need any of that list-building/
+    list-hover JS at all, so this is a genuinely separate, smaller render
+    path rather than the full one with a hidden list. The full,
+    list-included path (`compact=False`, the default) is unchanged from
+    before -- confirmed working, deliberately not touched here beyond
+    adding this new branch ahead of it.
     """
     chart_id = f"donut-{uuid.uuid4().hex}"
     labels = [d["label"] for d in data]
     values = [d["value"] for d in data]
     total = sum(values)
     colors = colors or []
+
+    if compact:
+        # A fixed square div, not "width:100%" -- at 100%, Plotly centers
+        # the pie across the *whole* iframe by default, sized to whatever
+        # that width happens to be. Fixing the pie's own footprint first
+        # (so its size is predictable and matches the `height` argument
+        # regardless of column width) and then centering *that* fixed box
+        # with plain flexbox is what keeps it lined up with the view
+        # selector above -- which is centered the same way, in its own
+        # st.container(horizontal_alignment="center") on the Python side
+        # (see views/overview.py) -- at any column width, rather than the
+        # two only lining up by coincidence at one particular width (what
+        # Matteo saw drift apart after collapsing the sidebar, before this
+        # was a fixed+centered box on both sides of the pairing).
+        html = f"""
+        <style>html, body {{ margin:0; padding:0; overflow:hidden; }}</style>
+        <div style="display:flex; justify-content:center;">
+            <div id="{chart_id}" style="width:{height}px; height:{height}px; font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"></div>
+        </div>
+        <script src="{_PLOTLY_CDN}"></script>
+        <script>
+        (function() {{
+            const labels = {json.dumps(labels)};
+            const values = {json.dumps(values)};
+            const total = {json.dumps(total)};
+            const centerLabel = {json.dumps(view_name)};
+            const palette = {json.dumps(colors)};
+            const inkColor = {json.dumps(ink)};
+            const mutedColor = {json.dumps(muted)};
+            const chartId = {json.dumps(chart_id)};
+
+            const sliceColors = labels.map((_, i) => palette.length ? palette[i % palette.length] : '#3987e5');
+
+            function fmtEuro(v) {{
+                return '€' + v.toLocaleString('nl-NL', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+            }}
+
+            function escapeHtml(text) {{
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }}
+
+            function hexToRgba(hex, alpha) {{
+                const h = hex.replace('#', '');
+                const r = parseInt(h.substring(0, 2), 16);
+                const g = parseInt(h.substring(2, 4), 16);
+                const b = parseInt(h.substring(4, 6), 16);
+                return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+            }}
+
+            function cardText(label, value) {{
+                return '<span style="font-size:12px;color:' + mutedColor + '">' + escapeHtml(label) + '</span><br>' +
+                       '<span style="font-size:18px;color:' + inkColor + '"><b>' + fmtEuro(value) + '</b></span>';
+            }}
+
+            const baseText = cardText(centerLabel, total);
+            const FADED_OPACITY = 0.32;
+
+            const trace = [{{
+                type: 'pie',
+                hole: 0.72,
+                labels: labels,
+                values: values,
+                textinfo: 'none',
+                hoverinfo: 'none',
+                marker: {{ colors: sliceColors, line: {{ color: 'rgba(0,0,0,0.4)', width: 2 }} }},
+                sort: false
+            }}];
+
+            const layout = {{
+                showlegend: false,
+                margin: {{t: 10, b: 10, l: 10, r: 10}},
+                paper_bgcolor: 'rgba(0,0,0,0)',
+                plot_bgcolor: 'rgba(0,0,0,0)',
+                font: {{ family: "system-ui, -apple-system, 'Segoe UI', sans-serif" }},
+                annotations: [{{
+                    text: baseText,
+                    showarrow: false,
+                    align: 'center',
+                    font: {{ size: 13, color: inkColor }}
+                }}]
+            }};
+
+            Plotly.newPlot(chartId, trace, layout, {{displayModeBar: false, responsive: true}});
+            const chartDiv = document.getElementById(chartId);
+
+            function setActive(i) {{
+                const fadedColors = sliceColors.map((c, idx) => idx === i ? c : hexToRgba(c, FADED_OPACITY));
+                Plotly.restyle(chartId, {{ 'marker.colors': [fadedColors] }});
+                Plotly.relayout(chartId, {{ 'annotations[0].text': cardText(labels[i], values[i]) }});
+            }}
+
+            function clearActive() {{
+                Plotly.restyle(chartId, {{ 'marker.colors': [sliceColors] }});
+                Plotly.relayout(chartId, {{ 'annotations[0].text': baseText }});
+            }}
+
+            chartDiv.on('plotly_hover', function(evt) {{ setActive(evt.points[0].pointNumber); }});
+            chartDiv.on('plotly_unhover', function() {{ clearActive(); }});
+        }})();
+        </script>
+        """
+        components.html(html, height=height + 8, scrolling=False)
+        return
 
     # `components.v1.html()` embeds this string as a full srcdoc document,
     # not an inline snippet -- an un-styled <body> carries the browser's
