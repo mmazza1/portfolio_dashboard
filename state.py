@@ -27,7 +27,6 @@ import aggregations
 from enrichment import enrich_positions
 from formatting import format_number, format_pct
 from parser import parse_degiro_csv
-from views import performance
 
 # TESTING ONLY -- when True, skips the file uploader and loads DEV_DATA_PATH
 # from disk instead, so local dev/testing doesn't need a re-upload every run.
@@ -39,16 +38,9 @@ from views import performance
 # pipeline itself. MUST be set back to False before deploying the public
 # version or sharing this app with anyone else -- it bypasses the upload
 # flow entirely.
-DEV_MODE = True
+DEV_MODE = False
 DEV_DATA_PATH = "dev_data/Portfolio.csv"
 DEV_SNAPSHOT_PATH = "dev_data/enriched_snapshot.parquet"
-# Same dev-mode convenience, for the optional Performance view: if this
-# exists, dev mode enables performance tracking automatically instead of
-# waiting on a manual upload. No caching layer here like DEV_SNAPSHOT_PATH --
-# reconstructing value history is one @st.cache_data call already (see
-# views/performance.py's load_and_reconstruct_value_history), cheap enough
-# not to need a second one.
-DEV_ACCOUNT_PATH = "dev_data/Account.csv"
 # Hidden, not deleted: the Dividends section (views/dividends.py) isn't
 # behaving as intended yet -- Matteo asked for it off the dashboard
 # entirely until that's sorted, but kept in the codebase rather than torn
@@ -72,7 +64,7 @@ _DEV_SNAPSHOT_JSON_COLUMNS = ["enrich_sector_weights", "enrich_region_weights", 
 # no obvious link back to "the cached snapshot is just stale."
 _EXPECTED_ENRICH_COLUMNS = {
     "enrich_isin",
-    "enrich_ticker",
+    "enrich_ticker",    
     "enrich_name",
     "enrich_asset_type",
     "enrich_sector_weights",
@@ -97,7 +89,6 @@ class DashboardState:
     scope: str
     scope_suffix: str
     display_total_value: float
-    account_dividends: pd.DataFrame | None
 
 
 def _sync_dev_data(path: str, file_bytes: bytes) -> None:
@@ -140,8 +131,7 @@ def load_and_enrich(file_bytes: bytes) -> pd.DataFrame:
 
 
 def load_dashboard_state() -> DashboardState:
-    """Renders the title/upload button, the Performance sidebar section, the
-    Portfolio.csv upload-or-dev-load flow, the sidebar concentration and
+    """Renders the title/upload button, the Portfolio.csv upload-or-dev-load flow, the sidebar concentration and
     target-allocation controls, and the top-of-page banners -- then returns
     the filtered dataframes every page's own content needs. Call this once
     at the very top of each page's render function, before that page draws
@@ -152,10 +142,7 @@ def load_dashboard_state() -> DashboardState:
     # there's no way to tell "user hasn't uploaded yet" from "user uploaded,
     # widget just isn't holding onto it across reruns" apart from re-reading
     # the widget's own live value, which is exactly what disappearing the
-    # widget would lose. `show_upload_panel` is the one flag that brings both
-    # uploaders (Portfolio.csv here, Account.csv in the sidebar below) back --
-    # a single button covers both, since re-uploading one commonly means
-    # re-exporting the other too (a fresher DEGIRO CSV pair).
+    # widget would lose.
     st.session_state.setdefault("show_upload_panel", True)
 
     title_col, upload_button_col = st.columns([6, 1])
@@ -166,8 +153,6 @@ def load_dashboard_state() -> DashboardState:
             st.write("")  # nudge the button down to roughly the title's baseline
             if st.button("📤 Upload new files", width="stretch"):
                 st.session_state["show_upload_panel"] = True
-
-    account_dividends = performance.render_performance_section(DEV_MODE, DEV_ACCOUNT_PATH)
 
     if DEV_MODE:
         st.sidebar.subheader("Dev mode")
@@ -366,5 +351,4 @@ def load_dashboard_state() -> DashboardState:
         scope=scope,
         scope_suffix=scope_suffix,
         display_total_value=display_total_value,
-        account_dividends=account_dividends,
     )

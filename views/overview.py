@@ -104,9 +104,4 @@ def render_overview_page() -> None:
         rebalance_view.render_rebalance_tab(dashboard.etf_only, dashboard.cash_value)
 
     if SHOW_DIVIDENDS_SECTION:
-        dividends.render_dividends_section(
-            dashboard.display_source,
-            dashboard.display_total_value,
-            dashboard.scope_suffix,
-            dashboard.account_dividends,
-        )
+        dividends.render_dividends_section(dashboard.display_source, dashboard.display_total_value, dashboard.scope_suffix)
