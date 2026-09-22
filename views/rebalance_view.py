@@ -37,6 +37,19 @@ def render_rebalance_tab(etf_only: pd.DataFrame, cash_value: float) -> None:
             enrich_region_weights=etf_only["enrich_region_weights"].apply(aggregations.continent_weights)
         )
     matrix, values = rebalance.build_weight_matrix(rebalance_source, weights_col)
+    # Empty when every held ETF's enrich_sector_weights/enrich_region_weights
+    # came back {} -- a bad/rate-limited Yahoo Finance lookup (more likely on
+    # a shared cloud IP than locally), not something this page can solve. A
+    # zero-column matrix would otherwise crash a few lines down at
+    # st.columns(0), which Streamlit rejects outright (needs >= 1) -- same
+    # "never raise on a bad lookup, surface it" policy as enrichment.py.
+    if matrix.columns.empty:
+        st.info(
+            f"No {rebalance_dimension.lower()} data available for your ETF holdings right now -- "
+            "this usually means the Yahoo Finance lookup failed or was rate-limited. Try refreshing the page "
+            "in a moment."
+        )
+        return
     prices, shares = rebalance.build_trade_inputs(rebalance_source)
     raw_pct = pd.Series(matrix.values.T @ values.values / values.sum() * 100, index=matrix.columns)
     default_pct = aggregations.round_percentages(raw_pct)
