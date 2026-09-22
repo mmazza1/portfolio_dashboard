@@ -43,6 +43,7 @@ so the two aren't conflated.
 
 import csv
 import os
+import time
 
 import justetf_scraping
 import pandas as pd
@@ -244,13 +245,37 @@ def _resolve_dividend_yield(ticker_obj: yf.Ticker) -> float | None:
         return None
 
 
+# Attempts and base delay (seconds, doubled each retry) for _resolve_quote's
+# retry loop -- see its own docstring for why this exists at all.
+_TICKER_RESOLVE_ATTEMPTS = 3
+_TICKER_RESOLVE_RETRY_DELAY = 0.75
+
+
 def _resolve_quote(isin: str) -> dict | None:
+    """Resolve an ISIN to its best-match Yahoo Finance quote via yf.Search,
+    retried a few times with a short backoff before giving up. Confirmed in
+    real use: this call fails intermittently and inconsistently on
+    Streamlit Community Cloud's shared IP range -- an ISIN that resolves
+    every single time locally (e.g. AST SpaceMobile's US00217D1000) can
+    come back with zero quotes on Cloud, then resolve fine again a minute
+    later. Yahoo's rate-limit response for this endpoint has been observed
+    to come back as a quietly empty result, not a raised error, so this
+    retries on an empty result too, not just on an exception. Deliberately
+    bounded (3 tries, doubling delay) rather than unbounded -- a genuinely
+    unresolvable ISIN should still fail within a couple of seconds, not
+    stall the whole enrichment run.
+    """
     query = OVERRIDES.get(isin, {}).get("ticker") or isin
-    try:
-        quotes = yf.Search(query, max_results=8).quotes
-    except Exception:
-        return None
-    return quotes[0] if quotes else None
+    for attempt in range(_TICKER_RESOLVE_ATTEMPTS):
+        try:
+            quotes = yf.Search(query, max_results=8).quotes
+        except Exception:
+            quotes = []
+        if quotes:
+            return quotes[0]
+        if attempt < _TICKER_RESOLVE_ATTEMPTS - 1:
+            time.sleep(_TICKER_RESOLVE_RETRY_DELAY * (2**attempt))
+    return None
 
 
 def _enrich_stock(ticker: str) -> dict:
