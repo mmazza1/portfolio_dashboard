@@ -77,6 +77,36 @@ _SECTOR_KEY_MAP = {
     "healthcare": "Healthcare",
 }
 
+# justETF's own sector taxonomy (ICB-based), used only as a fallback when
+# Yahoo's `funds_data.sector_weightings` comes back empty -- see
+# `_justetf_sector_weights`. Different vocabulary than Yahoo's GICS-based
+# one above, so this remaps justETF's names onto the same Title Case buckets
+# a stock's own Yahoo-sourced `sector` field uses, the same reason
+# `_SECTOR_KEY_MAP` exists for Yahoo's own snake_case ETF keys -- otherwise
+# a fallback-sourced ETF wouldn't sum into the same sector buckets as
+# everything else on the Allocation donut and concentration check. A few
+# justETF categories fold into one GICS bucket where GICS doesn't split
+# them as finely (its "Business Services" -> GICS's "Industrials", both
+# "Consumer Cyclicals" and "Consumer Services" -> GICS's "Consumer
+# Cyclical", which already covers retail/leisure). "Other" is deliberately
+# left unmapped -- it passes through as its own bucket, same convention
+# used elsewhere in this app (e.g. region continent bucketing).
+_JUSTETF_SECTOR_MAP = {
+    "Technology": "Technology",
+    "Finance": "Financial Services",
+    "Industrials": "Industrials",
+    "Business Services": "Industrials",
+    "Consumer Non-Cyclicals": "Consumer Defensive",
+    "Healthcare": "Healthcare",
+    "Non-Energy Materials": "Basic Materials",
+    "Consumer Cyclicals": "Consumer Cyclical",
+    "Consumer Services": "Consumer Cyclical",
+    "Energy": "Energy",
+    "Utilities": "Utilities",
+    "Telecommunication": "Communication Services",
+    "Real Estate": "Real Estate",
+}
+
 def _load_overrides() -> dict[str, dict]:
     if not os.path.exists(_OVERRIDES_PATH):
         return {}
@@ -166,6 +196,30 @@ def _resolve_etf_overview(isin: str) -> tuple[dict[str, float], float | None]:
     return FUND_REGIONS_CACHE[isin], FUND_TER_CACHE.get(isin)
 
 
+def _justetf_sector_weights(isin: str) -> dict[str, float]:
+    """Fallback sector breakdown, from justETF, used only when Yahoo's own
+    `funds_data.sector_weightings` comes back empty for an ETF -- confirmed
+    to happen for every held ETF at once on a rate-limited/blocked cloud
+    IP (see PROJECT_PLAN.md's Rebalancing calculator bug), which used to
+    crash the Rebalance tab outright with no sector data available at all.
+    Deliberately *not* cached to a CSV the way region/TER are (see
+    `_resolve_etf_overview`) -- caching a fallback value would mean it
+    stays stuck even after Yahoo recovers, defeating the point of
+    preferring Yahoo whenever it's actually working; this just re-fetches
+    from justETF live each time it's needed; a fresh justETF failure here
+    too just means an empty dict, same as an unresolved Yahoo lookup.
+    """
+    try:
+        overview = justetf_scraping.get_etf_overview(isin)
+    except Exception:
+        return {}
+    weights: dict[str, float] = {}
+    for entry in overview.get("sectors") or []:
+        bucket = _JUSTETF_SECTOR_MAP.get(entry["name"], entry["name"])
+        weights[bucket] = weights.get(bucket, 0.0) + entry["percentage"] / 100
+    return weights
+
+
 def _resolve_dividend_yield(ticker_obj: yf.Ticker) -> float | None:
     """Trailing-12-month dividend yield (a 0-1 fraction), derived from the
     per-payment history rather than Yahoo's own dividendYield field (see
@@ -220,6 +274,12 @@ def _enrich_etf(ticker: str, isin: str) -> dict:
     sector_weights = {}
     for key, weight in (fund.sector_weightings or {}).items():
         sector_weights[_SECTOR_KEY_MAP.get(key, key)] = weight
+    if not sector_weights:
+        # Yahoo's own sector lookup came back empty -- fall back to
+        # justETF's, remapped onto the same buckets (see
+        # _JUSTETF_SECTOR_MAP). Only reached in this failure case, not on
+        # every ETF, so the common (Yahoo-works) path pays no extra cost.
+        sector_weights = _justetf_sector_weights(isin)
 
     top_holdings = list(fund.top_holdings.index) if fund.top_holdings is not None else []
     region_weights, ter = _resolve_etf_overview(isin)
